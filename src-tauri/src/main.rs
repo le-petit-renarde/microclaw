@@ -16,6 +16,10 @@ use tokio::sync::Mutex;
 struct AppState {
     server_port: Arc<Mutex<Option<u16>>>,
     child_process: Arc<Mutex<Option<tokio::process::Child>>>,
+    /// The bootstrap token printed by microclaw (if first-run)
+    bootstrap_token: Arc<Mutex<Option<String>>>,
+    /// The default password set by microclaw (if first-run)
+    default_password: Arc<Mutex<Option<String>>>,
 }
 
 #[tauri::command]
@@ -23,6 +27,16 @@ async fn get_server_url(state: tauri::State<'_, AppState>) -> Result<String, Str
     let port = state.server_port.lock().await;
     port.map(|p| format!("http://127.0.0.1:{}", p))
         .ok_or_else(|| "Server not started yet".to_string())
+}
+
+#[tauri::command]
+async fn get_bootstrap_info(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let token = state.bootstrap_token.lock().await;
+    let password = state.default_password.lock().await;
+    Ok(serde_json::json!({
+        "bootstrap_token": *token,
+        "default_password": *password,
+    }))
 }
 
 fn main() {
@@ -34,10 +48,47 @@ fn main() {
             let gui_dir = gui_directory();
             let config_path = find_config_file(&gui_dir);
 
+            let bootstrap_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let default_password: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let bt = bootstrap_token.clone();
+            let dp = default_password.clone();
+
             tauri::async_runtime::spawn(async move {
-                match start_microclaw_server(&microclaw_binary, &gui_dir, config_path.as_ref()).await {
+                match start_microclaw_server(
+                    &microclaw_binary,
+                    &gui_dir,
+                    config_path.as_ref(),
+                    &bt,
+                    &dp,
+                )
+                .await
+                {
                     Ok((port, mut child)) => {
                         println!("MicroClaw server started on port {}", port);
+
+                        // If this is a first-run bootstrap, auto-set the password
+                        if let Some(token) = bt.lock().await.as_ref() {
+                            let password = dp.lock().await.clone()
+                                .unwrap_or_else(|| "microclaw".to_string());
+                            println!(
+                                "First-run detected. Auto-setting password using bootstrap token..."
+                            );
+                            match auto_set_password(port, token, &password).await {
+                                Ok(()) => {
+                                    println!(
+                                        "Password set successfully! Your password is: {}",
+                                        password
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Failed to auto-set password: {}. You can set it manually \
+                                         using the bootstrap token: {}",
+                                        e, token
+                                    );
+                                }
+                            }
+                        }
 
                         tokio::select! {
                             status = child.wait() => {
@@ -63,6 +114,8 @@ fn main() {
         .manage(AppState {
             server_port: Arc::new(Mutex::new(None)),
             child_process: Arc::new(Mutex::new(None)),
+            bootstrap_token,
+            default_password,
         })
         .run(tauri::generate_context!())
         .expect("error while running MicroClaw GUI");
@@ -87,14 +140,12 @@ fn find_microclaw_binary() -> String {
 }
 
 fn find_config_file(gui_dir: &PathBuf) -> Option<PathBuf> {
-    // Check MICROCLAW_CONFIG env var first
     if let Ok(env_path) = std::env::var("MICROCLAW_CONFIG") {
         let p = PathBuf::from(&env_path);
         if p.exists() {
             return Some(p);
         }
     }
-    // Then look alongside the GUI binary
     for name in &["microclaw.config.yaml", "microclaw.config.yml"] {
         let candidate = gui_dir.join(name);
         if candidate.exists() {
@@ -108,6 +159,8 @@ async fn start_microclaw_server(
     binary: &str,
     gui_dir: &PathBuf,
     config_path: Option<&PathBuf>,
+    bootstrap_token: &Arc<Mutex<Option<String>>>,
+    default_password: &Arc<Mutex<Option<String>>>,
 ) -> anyhow::Result<(u16, tokio::process::Child)> {
     let mut cmd = Command::new(binary);
     cmd.arg("start")
@@ -116,10 +169,8 @@ async fn start_microclaw_server(
         .kill_on_drop(true)
         .current_dir(gui_dir);
 
-    // Pass --config if we found one
     if let Some(cfg) = config_path {
         cmd.arg("--config").arg(cfg);
-        // Also set the env var so child processes (gateway, etc.) pick it up
         cmd.env("MICROCLAW_CONFIG", cfg);
     }
 
@@ -130,7 +181,12 @@ async fn start_microclaw_server(
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
     let stderr = child.stderr.take().context("Failed to capture stderr")?;
 
+    // Regexes for parsing microclaw startup output
     let url_regex = Regex::new(r"Web UI available at http://[\d.]+:(\d+)")?;
+    let bootstrap_regex =
+        Regex::new(r"x-bootstrap-token=([a-f0-9\-]+)")?;
+    let default_pw_regex =
+        Regex::new(r"Temporary password is '([^']+)'")?;
 
     let stdout_reader = BufReader::new(stdout);
     let mut stdout_lines = stdout_reader.lines();
@@ -150,6 +206,20 @@ async fn start_microclaw_server(
                 match line_result {
                     Ok(Some(line)) => {
                         println!("[microclaw] {}", line);
+
+                        // Capture bootstrap token
+                        if let Some(caps) = bootstrap_regex.captures(&line) {
+                            if let Some(token) = caps.get(1) {
+                                *bootstrap_token.lock().await = Some(token.as_str().to_string());
+                            }
+                        }
+                        // Capture default password
+                        if let Some(caps) = default_pw_regex.captures(&line) {
+                            if let Some(pw) = caps.get(1) {
+                                *default_password.lock().await = Some(pw.as_str().to_string());
+                            }
+                        }
+                        // Detect server URL
                         if let Some(caps) = url_regex.captures(&line) {
                             if let Some(port_str) = caps.get(1) {
                                 let p: u16 = port_str.as_str().parse()?;
@@ -195,4 +265,30 @@ async fn start_microclaw_server(
         .await
         .ok_or_else(|| anyhow::anyhow!("Could not determine server port"))?;
     Ok((port, child))
+}
+
+/// Auto-set the operator password using the bootstrap token.
+/// This prevents the user from ever seeing the "set password" panel.
+async fn auto_set_password(port: u16, bootstrap_token: &str, password: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/api/auth/password", port);
+
+    // Wait a moment for the server to be fully ready
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let resp = client
+        .post(&url)
+        .header("x-bootstrap-token", bootstrap_token)
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({"password": password}))
+        .send()
+        .await
+        .context("Failed to send set-password request")?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Set-password failed ({}): {}", resp.status(), body);
+    }
+
+    Ok(())
 }
