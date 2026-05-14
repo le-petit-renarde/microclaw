@@ -3,6 +3,7 @@
 
 use anyhow::Context;
 use regex::Regex;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,9 +31,11 @@ fn main() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             let microclaw_binary = find_microclaw_binary();
+            let gui_dir = gui_directory();
+            let config_path = find_config_file(&gui_dir);
 
             tauri::async_runtime::spawn(async move {
-                match start_microclaw_server(&microclaw_binary).await {
+                match start_microclaw_server(&microclaw_binary, &gui_dir, config_path.as_ref()).await {
                     Ok((port, mut child)) => {
                         println!("MicroClaw server started on port {}", port);
 
@@ -65,26 +68,62 @@ fn main() {
         .expect("error while running MicroClaw GUI");
 }
 
+fn gui_directory() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn find_microclaw_binary() -> String {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(dir) = exe_path.parent() {
-            let candidate = dir
-                .join("microclaw")
-                .with_extension(std::env::consts::EXE_EXTENSION);
-            if candidate.exists() {
-                return candidate.to_string_lossy().to_string();
-            }
-        }
+    let gui_dir = gui_directory();
+    let candidate = gui_dir
+        .join("microclaw")
+        .with_extension(std::env::consts::EXE_EXTENSION);
+    if candidate.exists() {
+        return candidate.to_string_lossy().to_string();
     }
     "microclaw".to_string()
 }
 
-async fn start_microclaw_server(binary: &str) -> anyhow::Result<(u16, tokio::process::Child)> {
-    let mut child = Command::new(binary)
-        .arg("start")
+fn find_config_file(gui_dir: &PathBuf) -> Option<PathBuf> {
+    // Check MICROCLAW_CONFIG env var first
+    if let Ok(env_path) = std::env::var("MICROCLAW_CONFIG") {
+        let p = PathBuf::from(&env_path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Then look alongside the GUI binary
+    for name in &["microclaw.config.yaml", "microclaw.config.yml"] {
+        let candidate = gui_dir.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+async fn start_microclaw_server(
+    binary: &str,
+    gui_dir: &PathBuf,
+    config_path: Option<&PathBuf>,
+) -> anyhow::Result<(u16, tokio::process::Child)> {
+    let mut cmd = Command::new(binary);
+    cmd.arg("start")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
+        .current_dir(gui_dir);
+
+    // Pass --config if we found one
+    if let Some(cfg) = config_path {
+        cmd.arg("--config").arg(cfg);
+        // Also set the env var so child processes (gateway, etc.) pick it up
+        cmd.env("MICROCLAW_CONFIG", cfg);
+    }
+
+    let mut child = cmd
         .spawn()
         .context("Failed to spawn microclaw process. Make sure microclaw is installed.")?;
 
