@@ -8,6 +8,7 @@ members = [
     "crates/microclaw-channels",
     "crates/microclaw-app",
     "crates/microclaw-observability",
+    "src-tauri",
 ]
 resolver = "2"
 
