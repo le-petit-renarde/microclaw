@@ -40,18 +40,18 @@ async fn get_bootstrap_info(state: tauri::State<'_, AppState>) -> Result<serde_j
 }
 
 fn main() {
+    let bootstrap_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let default_password: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let bt = bootstrap_token.clone();
+    let dp = default_password.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .setup(|app| {
+        .setup(move |app| {
             let app_handle = app.handle().clone();
             let microclaw_binary = find_microclaw_binary();
             let gui_dir = gui_directory();
             let config_path = find_config_file(&gui_dir);
-
-            let bootstrap_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-            let default_password: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-            let bt = bootstrap_token.clone();
-            let dp = default_password.clone();
 
             tauri::async_runtime::spawn(async move {
                 match start_microclaw_server(
@@ -285,9 +285,10 @@ async fn auto_set_password(port: u16, bootstrap_token: &str, password: &str) -> 
         .await
         .context("Failed to send set-password request")?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Set-password failed ({}): {}", resp.status(), body);
+        anyhow::bail!("Set-password failed ({}): {}", status, body);
     }
 
     Ok(())
